@@ -13,8 +13,7 @@ const app = express();
 // --------------------
 const PORT = process.env.PORT || 3001;
 
-// Em produção (Railway/Cloudflare), o site vai estar em outro domínio.
-// Aqui liberamos CORS de forma prática. Depois, se quiser, eu travo para o seu domínio.
+// CORS liberado (prático). Depois, se quiser, travo só no seu domínio.
 app.use(
   cors({
     origin: true,
@@ -30,16 +29,77 @@ app.use(express.json({ limit: "1mb" }));
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Banco SQLite em: server/data/certificados.db
 const dataDir = path.join(__dirname, "..", "data");
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
 const dbPath = path.join(dataDir, "certificados.db");
 const db = new sqlite3.Database(dbPath);
 
-// Cria tabela se não existir
-db.serialize(() => {
-  db.run(`
+// --------------------
+// Helpers
+// --------------------
+function normalizeCPF(value = "") {
+  return String(value).replace(/\D/g, "");
+}
+function normalizeName(value = "") {
+  return String(value).trim();
+}
+function normalizeCode(value = "") {
+  return String(value).trim();
+}
+
+function authUser() {
+  return process.env.ADMIN_USER || "admin";
+}
+function authPass() {
+  return process.env.ADMIN_PASS || "admin123";
+}
+
+// Token simples (pra bater com o client): base64("user:pass")
+function makeToken(user, pass) {
+  return Buffer.from(`${user}:${pass}`).toString("base64");
+}
+
+function verifyBearer(req) {
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Bearer ")) return false;
+  const token = header.slice("Bearer ".length).trim();
+  const expected = makeToken(authUser(), authPass());
+  return token === expected;
+}
+
+function requireAdmin(req, res, next) {
+  if (!verifyBearer(req)) {
+    return res.status(401).json({ message: "Não autorizado" });
+  }
+  next();
+}
+
+// Promises simples para sqlite
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve({ lastID: this.lastID, changes: this.changes });
+    });
+  });
+}
+
+// --------------------
+// DB init + migration
+// --------------------
+async function ensureSchema() {
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS certificados (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       nome TEXT NOT NULL,
@@ -48,248 +108,222 @@ db.serialize(() => {
       carga_horaria TEXT NOT NULL,
       data_conclusao TEXT NOT NULL,
       codigo TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'VALIDO',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
 
-  // Índices para melhorar buscas
-  db.run(`CREATE INDEX IF NOT EXISTS idx_certificados_cpf ON certificados (cpf)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_certificados_nome ON certificados (nome)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_certificados_codigo ON certificados (codigo)`);
-});
+  // garantir índices
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_certificados_cpf ON certificados (cpf)`);
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_certificados_nome ON certificados (nome)`);
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_certificados_codigo ON certificados (codigo)`);
 
-// --------------------
-// Helpers
-// --------------------
-function normalizeCPF(value = "") {
-  return String(value).replace(/\D/g, "");
-}
-
-function normalizeName(value = "") {
-  return String(value).trim();
-}
-
-function generateCode(prefix = "CIP") {
-  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const nums = "0123456789";
-  const pick = (s) => s[Math.floor(Math.random() * s.length)];
-  return `${prefix}-${pick(letters)}${pick(letters)}${pick(nums)}${pick(nums)}${pick(nums)}${pick(nums)}`;
-}
-
-function isAdminAuth(req) {
-  const user = process.env.ADMIN_USER || "admin";
-  const pass = process.env.ADMIN_PASS || "admin123";
-
-  const auth = req.headers.authorization || "";
-  if (!auth.startsWith("Basic ")) return false;
-
-  const base64 = auth.replace("Basic ", "").trim();
-  const decoded = Buffer.from(base64, "base64").toString("utf8"); // user:pass
-  const [u, p] = decoded.split(":");
-
-  return u === user && p === pass;
-}
-
-function requireAdmin(req, res, next) {
-  if (!isAdminAuth(req)) {
-    return res.status(401).json({ ok: false, message: "Não autorizado" });
+  // migração: se tabela já existia sem coluna status, adiciona
+  const cols = await dbAll(`PRAGMA table_info(certificados)`);
+  const hasStatus = (cols || []).some((c) => c?.name === "status");
+  if (!hasStatus) {
+    await dbRun(`ALTER TABLE certificados ADD COLUMN status TEXT NOT NULL DEFAULT 'VALIDO'`);
   }
-  next();
 }
+
+await ensureSchema();
 
 // --------------------
 // Health check
 // --------------------
 app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "CIP Certificates API",
-    db: dbPath,
-  });
+  res.json({ ok: true, service: "CIP Certificates API", db: dbPath });
 });
 
 // --------------------
-// Auth
+// PUBLIC API (compatível com client/api.ts)
 // --------------------
-// Login simples: o frontend manda { usuario, senha } e nós validamos com .env
-app.post("/auth/login", (req, res) => {
-  const { usuario, senha } = req.body || {};
 
-  const user = process.env.ADMIN_USER || "admin";
-  const pass = process.env.ADMIN_PASS || "admin123";
+// GET /api/certificates/search?type=code|cpf|name&q=...
+app.get("/api/certificates/search", async (req, res) => {
+  try {
+    const type = String(req.query.type || "").toLowerCase();
+    const qRaw = String(req.query.q || "");
 
-  if (usuario === user && senha === pass) {
-    // O frontend pode guardar um "basic token"
-    const token = Buffer.from(`${usuario}:${senha}`).toString("base64");
-    return res.json({ ok: true, token });
-  }
-
-  return res.status(401).json({ ok: false, message: "Usuário ou senha inválidos" });
-});
-
-// --------------------
-// Public consultation
-// --------------------
-// /consulta?tipo=codigo&valor=...
-// tipos: codigo | cpf | nome
-app.get("/consulta", (req, res) => {
-  const tipo = String(req.query.tipo || "").toLowerCase();
-  const valorRaw = String(req.query.valor || "");
-
-  if (!tipo || !valorRaw) {
-    return res.status(400).json({ ok: false, message: "Informe tipo e valor" });
-  }
-
-  let sql = "";
-  let param = "";
-
-  if (tipo === "codigo") {
-    sql = `SELECT * FROM certificados WHERE UPPER(codigo) = UPPER(?) LIMIT 1`;
-    param = valorRaw.trim();
-  } else if (tipo === "cpf") {
-    const cpf = normalizeCPF(valorRaw);
-    if (cpf.length !== 11) {
-      return res.status(400).json({ ok: false, message: "CPF inválido (precisa ter 11 números)" });
+    if (!type || !qRaw) {
+      return res.status(400).json({ message: "Informe type e q" });
     }
-    sql = `SELECT * FROM certificados WHERE cpf = ? LIMIT 1`;
-    param = cpf;
-  } else if (tipo === "nome") {
-    const nome = normalizeName(valorRaw);
-    if (nome.length < 3) {
-      return res.status(400).json({ ok: false, message: "Nome muito curto" });
-    }
-    // Busca parcial
-    sql = `SELECT * FROM certificados WHERE nome LIKE ? ORDER BY id DESC LIMIT 20`;
-    param = `%${nome}%`;
-  } else {
-    return res.status(400).json({ ok: false, message: "Tipo inválido. Use: codigo, cpf, nome" });
-  }
 
-  db.all(sql, [param], (err, rows) => {
-    if (err) return res.status(500).json({ ok: false, message: "Erro no banco", err: String(err) });
+    let row = null;
 
-    // Para codigo/cpf deve vir 0 ou 1; para nome pode vir lista
-    return res.json({ ok: true, resultados: rows || [] });
-  });
-});
-
-// Verificação por link oficial: /verificar/:codigo
-app.get("/verificar/:codigo", (req, res) => {
-  const codigo = String(req.params.codigo || "").trim();
-  if (!codigo) return res.status(400).json({ ok: false, message: "Código inválido" });
-
-  db.get(
-    `SELECT * FROM certificados WHERE UPPER(codigo) = UPPER(?) LIMIT 1`,
-    [codigo],
-    (err, row) => {
-      if (err) return res.status(500).json({ ok: false, message: "Erro no banco", err: String(err) });
-      if (!row) return res.status(404).json({ ok: false, message: "Certificado não encontrado" });
-
-      return res.json({ ok: true, certificado: row });
-    }
-  );
-});
-
-// --------------------
-// Admin endpoints (CRUD)
-// --------------------
-
-// Listar certificados (admin)
-app.get("/admin/certificados", requireAdmin, (req, res) => {
-  db.all(`SELECT * FROM certificados ORDER BY id DESC LIMIT 500`, [], (err, rows) => {
-    if (err) return res.status(500).json({ ok: false, message: "Erro no banco", err: String(err) });
-    res.json({ ok: true, itens: rows || [] });
-  });
-});
-
-// Criar certificado (admin)
-app.post("/admin/certificados", requireAdmin, (req, res) => {
-  const body = req.body || {};
-
-  const nome = normalizeName(body.nome);
-  const cpf = normalizeCPF(body.cpf);
-  const curso = normalizeName(body.curso);
-  const carga_horaria = normalizeName(body.carga_horaria);
-  const data_conclusao = normalizeName(body.data_conclusao);
-
-  let codigo = normalizeName(body.codigo);
-
-  if (!nome || !cpf || !curso || !carga_horaria || !data_conclusao) {
-    return res.status(400).json({ ok: false, message: "Campos obrigatórios faltando" });
-  }
-
-  if (cpf.length !== 11) {
-    return res.status(400).json({ ok: false, message: "CPF inválido (precisa ter 11 números)" });
-  }
-
-  if (!codigo) {
-    codigo = generateCode("CIP");
-  }
-
-  const sql = `
-    INSERT INTO certificados (nome, cpf, curso, carga_horaria, data_conclusao, codigo)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `;
-
-  db.run(sql, [nome, cpf, curso, carga_horaria, data_conclusao, codigo], function (err) {
-    if (err) {
-      // Se código duplicado, tenta gerar outro automaticamente
-      const msg = String(err);
-      if (msg.includes("UNIQUE") && msg.includes("codigo")) {
-        const novo = generateCode("CIP");
-        return db.run(sql, [nome, cpf, curso, carga_horaria, data_conclusao, novo], function (err2) {
-          if (err2) return res.status(500).json({ ok: false, message: "Erro no banco", err: String(err2) });
-          return res.json({ ok: true, id: this.lastID, codigo: novo });
-        });
+    if (type === "code") {
+      const code = normalizeCode(qRaw);
+      row = await dbGet(
+        `SELECT * FROM certificados WHERE UPPER(codigo)=UPPER(?) LIMIT 1`,
+        [code]
+      );
+    } else if (type === "cpf") {
+      const cpf = normalizeCPF(qRaw);
+      if (cpf.length !== 11) {
+        return res.status(400).json({ message: "CPF inválido (precisa ter 11 números)" });
       }
-      return res.status(500).json({ ok: false, message: "Erro no banco", err: msg });
+      row = await dbGet(`SELECT * FROM certificados WHERE cpf=? LIMIT 1`, [cpf]);
+    } else if (type === "name") {
+      const name = normalizeName(qRaw);
+      if (name.length < 3) {
+        return res.status(400).json({ message: "Nome muito curto" });
+      }
+      // pega o mais recente que bate com LIKE
+      row = await dbGet(
+        `SELECT * FROM certificados WHERE nome LIKE ? ORDER BY id DESC LIMIT 1`,
+        [`%${name}%`]
+      );
+    } else {
+      return res.status(400).json({ message: "Type inválido. Use: code, cpf, name" });
     }
 
-    res.json({ ok: true, id: this.lastID, codigo });
-  });
+    if (!row) return res.status(404).json({ message: "Certificado não encontrado" });
+
+    return res.json({ data: row });
+  } catch (e) {
+    return res.status(500).json({ message: "Erro no servidor", details: String(e) });
+  }
 });
 
-// Atualizar certificado (admin)
-app.put("/admin/certificados/:id", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
+// GET /api/certificates/:code
+app.get("/api/certificates/:code", async (req, res) => {
+  try {
+    const code = normalizeCode(req.params.code || "");
+    if (!code) return res.status(400).json({ message: "Código inválido" });
 
-  const body = req.body || {};
-  const nome = normalizeName(body.nome);
-  const cpf = normalizeCPF(body.cpf);
-  const curso = normalizeName(body.curso);
-  const carga_horaria = normalizeName(body.carga_horaria);
-  const data_conclusao = normalizeName(body.data_conclusao);
-  const codigo = normalizeName(body.codigo);
+    const row = await dbGet(
+      `SELECT * FROM certificados WHERE UPPER(codigo)=UPPER(?) LIMIT 1`,
+      [code]
+    );
+    if (!row) return res.status(404).json({ message: "Certificado não encontrado" });
 
-  if (!nome || !cpf || !curso || !carga_horaria || !data_conclusao || !codigo) {
-    return res.status(400).json({ ok: false, message: "Campos obrigatórios faltando" });
+    return res.json({ data: row });
+  } catch (e) {
+    return res.status(500).json({ message: "Erro no servidor", details: String(e) });
   }
-  if (cpf.length !== 11) {
-    return res.status(400).json({ ok: false, message: "CPF inválido (precisa ter 11 números)" });
-  }
-
-  const sql = `
-    UPDATE certificados
-    SET nome=?, cpf=?, curso=?, carga_horaria=?, data_conclusao=?, codigo=?
-    WHERE id=?
-  `;
-
-  db.run(sql, [nome, cpf, curso, carga_horaria, data_conclusao, codigo, id], function (err) {
-    if (err) return res.status(500).json({ ok: false, message: "Erro no banco", err: String(err) });
-    res.json({ ok: true, changes: this.changes });
-  });
 });
 
-// Remover certificado (admin)
-app.delete("/admin/certificados/:id", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) return res.status(400).json({ ok: false, message: "ID inválido" });
+// --------------------
+// ADMIN API (compatível com client/api.ts)
+// --------------------
 
-  db.run(`DELETE FROM certificados WHERE id=?`, [id], function (err) {
-    if (err) return res.status(500).json({ ok: false, message: "Erro no banco", err: String(err) });
-    res.json({ ok: true, changes: this.changes });
-  });
+// POST /api/admin/login  body: { user, pass }
+app.post("/api/admin/login", async (req, res) => {
+  const { user, pass } = req.body || {};
+  const u = String(user || "");
+  const p = String(pass || "");
+
+  if (u === authUser() && p === authPass()) {
+    return res.json({ token: makeToken(u, p) });
+  }
+  return res.status(401).json({ message: "Usuário ou senha inválidos" });
+});
+
+// GET /api/admin/certificates
+app.get("/api/admin/certificates", requireAdmin, async (_req, res) => {
+  try {
+    const rows = await dbAll(`SELECT * FROM certificados ORDER BY id DESC LIMIT 1000`);
+    return res.json({ data: rows || [] });
+  } catch (e) {
+    return res.status(500).json({ message: "Erro no servidor", details: String(e) });
+  }
+});
+
+// POST /api/admin/certificates
+app.post("/api/admin/certificates", requireAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+
+    const nome = normalizeName(b.nome);
+    const cpf = normalizeCPF(b.cpf);
+    const curso = normalizeName(b.curso);
+    const carga_horaria = normalizeName(b.carga_horaria);
+    const data_conclusao = normalizeName(b.data_conclusao);
+    const status = (String(b.status || "VALIDO").toUpperCase() === "INVALIDO") ? "INVALIDO" : "VALIDO";
+    const codigo = normalizeCode(b.codigo);
+
+    if (!nome || !cpf || !curso || !carga_horaria || !data_conclusao) {
+      return res.status(400).json({ message: "Campos obrigatórios faltando" });
+    }
+    if (cpf.length !== 11) {
+      return res.status(400).json({ message: "CPF inválido (precisa ter 11 números)" });
+    }
+
+    const finalCode = codigo || `CIP-${Math.random().toString(36).slice(2, 4).toUpperCase()}${Math.random().toString(36).slice(2, 4).toUpperCase()}${Math.floor(1000 + Math.random() * 9000)}`;
+
+    await dbRun(
+      `INSERT INTO certificados (nome, cpf, curso, carga_horaria, data_conclusao, codigo, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [nome, cpf, curso, carga_horaria, data_conclusao, finalCode, status]
+    );
+
+    const created = await dbGet(
+      `SELECT * FROM certificados WHERE UPPER(codigo)=UPPER(?) LIMIT 1`,
+      [finalCode]
+    );
+
+    return res.json({ data: created });
+  } catch (e) {
+    // código duplicado
+    const msg = String(e);
+    if (msg.includes("UNIQUE") && msg.includes("codigo")) {
+      return res.status(409).json({ message: "Código já existe. Tente outro código." });
+    }
+    return res.status(500).json({ message: "Erro no servidor", details: msg });
+  }
+});
+
+// PUT /api/admin/certificates/:id
+app.put("/api/admin/certificates/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: "ID inválido" });
+
+    const b = req.body || {};
+    const nome = normalizeName(b.nome);
+    const cpf = normalizeCPF(b.cpf);
+    const curso = normalizeName(b.curso);
+    const carga_horaria = normalizeName(b.carga_horaria);
+    const data_conclusao = normalizeName(b.data_conclusao);
+    const codigo = normalizeCode(b.codigo);
+    const status = (String(b.status || "VALIDO").toUpperCase() === "INVALIDO") ? "INVALIDO" : "VALIDO";
+
+    if (!nome || !cpf || !curso || !carga_horaria || !data_conclusao || !codigo) {
+      return res.status(400).json({ message: "Campos obrigatórios faltando" });
+    }
+    if (cpf.length !== 11) {
+      return res.status(400).json({ message: "CPF inválido (precisa ter 11 números)" });
+    }
+
+    await dbRun(
+      `UPDATE certificados
+       SET nome=?, cpf=?, curso=?, carga_horaria=?, data_conclusao=?, codigo=?, status=?
+       WHERE id=?`,
+      [nome, cpf, curso, carga_horaria, data_conclusao, codigo, status, id]
+    );
+
+    const updated = await dbGet(`SELECT * FROM certificados WHERE id=? LIMIT 1`, [id]);
+    return res.json({ data: updated });
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("UNIQUE") && msg.includes("codigo")) {
+      return res.status(409).json({ message: "Código já existe. Tente outro código." });
+    }
+    return res.status(500).json({ message: "Erro no servidor", details: msg });
+  }
+});
+
+// DELETE /api/admin/certificates/:id
+app.delete("/api/admin/certificates/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: "ID inválido" });
+
+    await dbRun(`DELETE FROM certificados WHERE id=?`, [id]);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ message: "Erro no servidor", details: String(e) });
+  }
 });
 
 // --------------------
